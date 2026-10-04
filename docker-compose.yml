@@ -1,0 +1,16 @@
+# 顶层项目名兜底：避免中文目录名导致 compose 项目名为空
+name: gbcheeseage
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-gbcheeseage}-frontend:latest
+    container_name: ${COMPOSE_PROJECT_NAME:-gbcheeseage}-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-22824}:80"
+    environment:
+      - TZ=Asia/Shanghai
+    # 纯前端应用：数据只存浏览器本地，无数据库服务、不挂载命名卷
