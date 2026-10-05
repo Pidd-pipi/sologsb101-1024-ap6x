@@ -7,6 +7,7 @@ import {
   type BackupPayload,
   type BatchArchive
 } from '@/utils/db'
+import type { TransferPlan } from '@/types/transfer'
 
 /** 导入 / 校验结果：校验失败时 errors 非空、payload 为 null */
 export interface ParseResult {
@@ -15,14 +16,12 @@ export interface ParseResult {
   payload: BackupPayload | null
 }
 
-const COLLECTIONS: Array<keyof Pick<BackupPayload, 'milks' | 'batches' | 'shelves' | 'turnings' | 'environments' | 'tastings'>> = [
-  'milks',
-  'batches',
-  'shelves',
-  'turnings',
-  'environments',
-  'tastings'
-]
+const COLLECTIONS: Array<
+  keyof Pick<
+    BackupPayload,
+    'milks' | 'batches' | 'shelves' | 'turnings' | 'environments' | 'tastings' | 'transferPlans'
+  >
+> = ['milks', 'batches', 'shelves', 'turnings', 'environments', 'tastings', 'transferPlans']
 
 function isPlainObject(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input)
@@ -55,7 +54,8 @@ export function validatePayload(input: unknown): ParseResult {
     shelves: (obj.shelves ?? []).filter((item) => typeof item?.id === 'string'),
     turnings: (obj.turnings ?? []).filter((item) => typeof item?.id === 'string'),
     environments: (obj.environments ?? []).filter((item) => typeof item?.id === 'string'),
-    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string')
+    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string'),
+    transferPlans: (obj.transferPlans ?? []).filter((item) => typeof item?.id === 'string')
   }
   if (payload.batches.length === 0 && payload.milks.length === 0) {
     errors.push('文件中没有任何奶源或批次记录')
@@ -64,6 +64,7 @@ export function validatePayload(input: unknown): ParseResult {
   // 引用完整性校验：批次的奶源、转架/环境/品评的批次必须能在文件内找到
   const milkIds = new Set(payload.milks.map((item) => item.id))
   const batchIds = new Set(payload.batches.map((item) => item.id))
+  const shelfIds = new Set(payload.shelves.map((item) => item.id))
   payload.batches.forEach((batch) => {
     if (!milkIds.has(batch.milkId)) {
       errors.push(`批次 ${batch.id} 引用了不存在的奶源 ${batch.milkId}`)
@@ -83,6 +84,28 @@ export function validatePayload(input: unknown): ParseResult {
     if (!batchIds.has(tasting.batchId)) {
       errors.push(`品评记录 ${tasting.id} 引用了不存在的批次 ${tasting.batchId}`)
     }
+  })
+  // 编排单校验：步骤引用的批次 / 窖位必须存在，步骤状态合法
+  const stepStatuses = new Set(['待执行', '已落地', '失败'])
+  payload.transferPlans.forEach((plan) => {
+    if (!Array.isArray(plan.steps)) {
+      errors.push(`编排单 ${plan.id} 缺少步骤数组 steps`)
+      return
+    }
+    plan.steps.forEach((step) => {
+      if (!batchIds.has(step.batchId)) {
+        errors.push(`编排单 ${plan.id} 的步骤 ${step.seq} 引用了不存在的批次 ${step.batchId}`)
+      }
+      if (!shelfIds.has(step.toShelfId)) {
+        errors.push(`编排单 ${plan.id} 的步骤 ${step.seq} 引用了不存在的目标窖位 ${step.toShelfId}`)
+      }
+      if (step.fromShelfId && !shelfIds.has(step.fromShelfId)) {
+        errors.push(`编排单 ${plan.id} 的步骤 ${step.seq} 引用了不存在的移出窖位 ${step.fromShelfId}`)
+      }
+      if (!stepStatuses.has(step.status)) {
+        errors.push(`编排单 ${plan.id} 的步骤 ${step.seq} 状态非法：${String(step.status)}`)
+      }
+    })
   })
   if (errors.length > 0) return { ok: false, errors, payload: null }
   return { ok: true, errors, payload }
@@ -126,14 +149,16 @@ function stamp(): string {
 
 /** 导出全量档案 JSON */
 export async function exportSnapshotJson(): Promise<{ fileName: string; counts: Record<string, number> }> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
-    db.milks.toArray(),
-    db.batches.toArray(),
-    db.shelves.toArray(),
-    db.turnings.toArray(),
-    db.environments.toArray(),
-    db.tastings.toArray()
-  ])
+  const [milks, batches, shelves, turnings, environments, tastings, transferPlans] =
+    await Promise.all([
+      db.milks.toArray(),
+      db.batches.toArray(),
+      db.shelves.toArray(),
+      db.turnings.toArray(),
+      db.environments.toArray(),
+      db.tastings.toArray(),
+      db.transferPlans.toArray()
+    ])
   const payload: BackupPayload = {
     app: 'gbcheeseage',
     dbVersion: DB_VERSION,
@@ -143,7 +168,8 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    transferPlans
   }
   const fileName = `gbcheeseage-archive-v${DB_VERSION}-${stamp()}.json`
   downloadJson(fileName, payload)
@@ -156,23 +182,25 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       shelves: shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      transferPlans: transferPlans.length
     }
   }
 }
 
-/** 导出单个批次的熟成档案（含奶源、窖位、转架、环境与品评） */
+/** 导出单个批次的熟成档案（含奶源、窖位、转架、环境、品评与涉及的转架编排单） */
 export async function exportBatchArchiveJson(
   batchId: string
 ): Promise<{ fileName: string; counts: Record<string, number> }> {
   const batch = await db.batches.get(batchId)
   if (!batch) throw new Error('批次不存在，无法导出')
-  const [milks, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, shelves, turnings, environments, tastings, allPlans] = await Promise.all([
     db.milks.toArray(),
     db.shelves.toArray(),
     db.turnings.where('batchId').equals(batchId).toArray(),
     db.environments.where('batchId').equals(batchId).toArray(),
-    db.tastings.where('batchId').equals(batchId).toArray()
+    db.tastings.where('batchId').equals(batchId).toArray(),
+    db.transferPlans.toArray()
   ])
   const archive: BatchArchive = {
     app: 'gbcheeseage',
@@ -185,7 +213,9 @@ export async function exportBatchArchiveJson(
     shelves: shelves.filter((shelf) => shelf.id === batch.shelfId),
     turnings,
     environments,
-    tastings
+    tastings,
+    // 编排单内嵌步骤，按「步骤涉及该批次」过滤
+    transferPlans: allPlans.filter((plan) => plan.steps.some((step) => step.batchId === batchId))
   }
   const fileName = `gbcheeseage-batch-${batchId}-${stamp()}.json`
   downloadJson(fileName, archive)
@@ -197,7 +227,8 @@ export async function exportBatchArchiveJson(
       shelves: archive.shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      transferPlans: archive.transferPlans.length
     }
   }
 }
@@ -210,7 +241,15 @@ export async function importSnapshotJson(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.transferPlans
+    ],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
@@ -218,6 +257,7 @@ export async function importSnapshotJson(
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
       await db.tastings.bulkPut(payload.tastings)
+      await db.transferPlans.bulkPut(payload.transferPlans)
     }
   )
   return {
@@ -226,7 +266,8 @@ export async function importSnapshotJson(
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    transferPlans: payload.transferPlans.length
   }
 }
 
@@ -256,12 +297,19 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
       shelfId: batch.shelfId ? shelfIdMap.get(batch.shelfId) ?? null : null
     }
   })
-  const turnings = payload.turnings.map((turning) => ({
-    ...turning,
-    id: createId('turn'),
-    batchId: batchIdMap.get(turning.batchId) ?? turning.batchId,
-    shelfId: shelfIdMap.get(turning.shelfId) ?? turning.shelfId
-  }))
+  const turnings = payload.turnings.map((turning) => {
+    const id = createId('turn')
+    return {
+      ...turning,
+      id,
+      batchId: batchIdMap.get(turning.batchId) ?? turning.batchId,
+      shelfId: shelfIdMap.get(turning.shelfId) ?? turning.shelfId
+    }
+  })
+  const turningIdMap = new Map<string, string>()
+  payload.turnings.forEach((turning, index) => {
+    turningIdMap.set(turning.id, turnings[index].id)
+  })
   const environments = payload.environments.map((record) => ({
     ...record,
     id: createId('env'),
@@ -272,6 +320,17 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
     id: createId('tast'),
     batchId: batchIdMap.get(tasting.batchId) ?? tasting.batchId
   }))
+  const transferPlans: TransferPlan[] = payload.transferPlans.map((plan) => ({
+    ...plan,
+    id: createId('trplan'),
+    steps: plan.steps.map((step) => ({
+      ...step,
+      batchId: batchIdMap.get(step.batchId) ?? step.batchId,
+      fromShelfId: step.fromShelfId ? shelfIdMap.get(step.fromShelfId) ?? null : null,
+      toShelfId: shelfIdMap.get(step.toShelfId) ?? step.toShelfId,
+      turningId: step.turningId ? turningIdMap.get(step.turningId) : undefined
+    }))
+  }))
 
-  return { ...payload, milks, batches, shelves, turnings, environments, tastings }
+  return { ...payload, milks, batches, shelves, turnings, environments, tastings, transferPlans }
 }

@@ -98,6 +98,7 @@ sologsb101-1024/
 | `/milk` | 奶源与批次台账 | 新建奶源与批次，按乳种 / 批次状态筛选并同步 URL query；按目标熟成天数自动算最早可出库日期；状态流转「凝乳 → 熟成中 → 已出库 / 报废」；级联删除奶源与批次 | Milk、Batch |
 | `/shelves` | 熟成库货架与窖位 | 库房 / 货架号 / 层号 / 温区 / 可放块数维护，占用率卡片与进度条；上架时按余量硬校验并实时更新 `occupied`；下架释放余量 | Shelf、Batch |
 | `/turnings` | 转架 / 翻面 / 擦洗作业 | 按批次生成等间隔计划（起始日 + 间隔天数 × 次数）；逐条签署「待执行 → 已完成 / 已跳过」；HTML5 原生拖拽调整同批次内顺序并写回 `seq` | Turning、Batch、Shelf |
+| `/transfers` | 转架编排（整批调拨） | 两组货架对调 / 整库挪位时，先按窖位容量推演「临时周转位 + 执行顺序」；确认后逐步办理，每步同事务回写批次窖位、窖位占用与转架作业；失败保留队列可续办，已落地步骤不重复占位；跨标签页提交互斥（后提交一方收冲突结果） | TransferPlan、Batch、Shelf、Turning |
 | `/environment` | 温湿度记录与曲线 | 按温区阈值自动判定越界并标异常，提示开窗 / 加湿措施；手写 SVG 温湿度双曲线 + 越界点；一键重算异常标记 | Environment、Batch、Shelf |
 | `/tastings` | 出库品评与档案导出 | 外观 / 风味 / 质地三维打分，同批次均分回写批次结论；JSON 全量导出导入（覆盖 / 追加两种模式）、单批次档案导出、重置并重新播种 | Tasting 及全部模型 |
 
@@ -108,10 +109,11 @@ sologsb101-1024/
 ## 五、IndexedDB 与数据存储说明
 
 - **数据库名**：`gbcheeseage`（Dexie 实例定义在 `frontend/src/utils/db.ts`）。
-- **结构版本**：`DB_VERSION = 2`。
+- **结构版本**：`DB_VERSION = 3`。
   - `version(1)`：初版六张业务表与索引。
   - `version(2).stores(...).upgrade(async (tx) => {...})`：**真实迁移**——为 `batches` 补齐 `shelfId` / `conclusion` / 时间戳；按作业日期为历史 `turnings` 回填 `seq` 执行序号；把湿度越界的 `environments` 记录重算为异常并补默认措施；把 `shelves` 的负数容量与占用数归零。
-- **六张表**：
+  - `version(3)`：新增 `transferPlans` 转架编排单表（内嵌有序步骤数组，步骤含 `status` / `failReason`）与 `kv` 键值仓（存放跨标签页编排锁 `orchestration:lock`，带 TTL 与心跳续期）；迁移为历史编排单补齐步骤数组与状态字段。
+- **八张表**：
 
 | 表 | 模型 | 关键字段 | 索引 |
 | --- | --- | --- | --- |
@@ -121,10 +123,14 @@ sologsb101-1024/
 | `turnings` | Turning 转架作业 | `batchId` `shelfId` `doneAt` `type`(转架/翻面/擦洗) `brinePct` `operator` `state` `seq` | id, batchId, shelfId, doneAt, type, state, seq |
 | `environments` | Environment 环境记录 | `batchId` `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, recordedAt, anomaly |
 | `tastings` | Tasting 品评 | `batchId` `outAt` `appearance/flavor/texture` 描述 + 三维评分 `score` `conclusion` `taster` | id, batchId, outAt, score, conclusion |
+| `transferPlans` | TransferPlan 转架编排单 | `code` `title` `status`(已编排/执行中/已完成/已失败/已取消) `steps`(内嵌：`seq` `batchId` `fromShelfId` `toShelfId` `kind`(临时周转/落位) `status`(待执行/已落地/失败) `turningId` `landedAt` `failReason`) `operator` `note` | id, code, status, createdAt, updatedAt |
+| `kv` | KvRecord 键值仓 | `value`（跨标签页编排锁等元数据） | id |
 
 - **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 4 → 转架 4 / 环境 4 / 品评 3），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
 - **localStorage**：仅存元数据 —— `gbcheeseage:db-version`（本地结构版本）、`gbcheeseage:last-backup-at`（最近一次导出时间）、`gbcheeseage:ui-prefs`（当前库房、作业排序方式、曲线指标）。
-- **导出 / 导入**：`frontend/src/utils/export.ts` 提供 `exportSnapshotJson()`（全量）、`exportBatchArchiveJson(batchId)`（单批次档案）与 `parseSnapshotJson()` 校验（校验 `app` 字段、各集合数组、父子引用完整性，失败抛出原因且不写入任何数据）；`/tastings` 页支持「覆盖导入」与「追加导入（重新分配 id）」。
+- **导出 / 导入**：`frontend/src/utils/export.ts` 提供 `exportSnapshotJson()`（全量，含编排单）、`exportBatchArchiveJson(batchId)`（单批次档案，含涉及该批次的编排单）与 `parseSnapshotJson()` 校验（校验 `app` 字段、各集合数组、父子引用完整性、编排单步骤引用与状态合法性，失败抛出原因且不写入任何数据）；`/tastings` 页支持「覆盖导入」与「追加导入（重新分配 id，编排单步骤引用同步重映射）」。
+- **转架编排（整批调拨）**：`frontend/src/utils/transferPlanner.ts` 按窖位容量把整批调拨推演为有序步骤——目标窖位有余量的批次直接落位；目标窖位全满形成死锁时（典型：两组货架对调），把占着别人目标位的批次先挪到临时周转位，其余批次依次落位；既无法落位又无临时位时拒绝编排并指明冲突批次与目标窖位。编排单（含步骤状态、失败原因）持久化在 `transferPlans` 表，刷新页面后可续办。执行引擎（`stores/transferStore.ts`）每步一个 Dexie 事务，同事务内回写批次窖位、窖位占用与一条转架作业；步骤已落地则跳过，转架作业用确定性 id（`turn_transfer_<编排单>_<步骤序>`），崩溃重试不重复占位、不重复生成作业。
+- **跨标签页互斥**：`frontend/src/utils/transferSync.ts` 通过 `kv` 仓的 `orchestration:lock` 记录（Dexie 读写事务在同一对象仓上天然跨标签页串行）实现全局编排锁，两个窗口同时提交不同编排单时，后提交一方收到冲突结果；锁带 60s TTL，执行期间每 15s 心跳续期，页面隐藏时主动释放。`BroadcastChannel('gbcheeseage-sync')` 在编排单落地后通知其他标签页刷新。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

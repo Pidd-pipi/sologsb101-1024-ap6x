@@ -5,13 +5,14 @@ import type { Shelf } from '@/types/shelf'
 import type { Turning } from '@/types/turning'
 import type { Environment } from '@/types/environment'
 import type { Tasting } from '@/types/tasting'
+import type { TransferPlan } from '@/types/transfer'
 import { addDays, diffDays } from '@/utils/temperature'
 
 /** IndexedDB 数据库名：与项目英文短名保持一致 */
 export const DB_NAME = 'gbcheeseage'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 键名（仅存少量元数据，业务数据一律在 IndexedDB） */
 export const LS_KEYS = {
@@ -19,6 +20,12 @@ export const LS_KEYS = {
   lastBackupAt: 'gbcheeseage:last-backup-at',
   uiPrefs: 'gbcheeseage:ui-prefs'
 } as const
+
+/** kv 键值仓：存放跨标签页编排锁等少量元数据 */
+export interface KvRecord {
+  id: string
+  value: unknown
+}
 
 export interface UiPrefs {
   /** 上次查看的库房 */
@@ -46,9 +53,10 @@ export interface BackupPayload {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  transferPlans: TransferPlan[]
 }
 
-/** 导出的批次熟成档案：含批次、奶源、窖位与全部子记录 */
+/** 导出的批次熟成档案：含批次、奶源、窖位、全部子记录与转架编排单 */
 export interface BatchArchive {
   app: 'gbcheeseage'
   dbVersion: number
@@ -61,6 +69,8 @@ export interface BatchArchive {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  /** 涉及该批次的转架编排单（含步骤状态与失败原因） */
+  transferPlans: TransferPlan[]
 }
 
 export class CheeseAgeDatabase extends Dexie {
@@ -70,6 +80,8 @@ export class CheeseAgeDatabase extends Dexie {
   turnings!: Table<Turning, string>
   environments!: Table<Environment, string>
   tastings!: Table<Tasting, string>
+  transferPlans!: Table<TransferPlan, string>
+  kv!: Table<KvRecord, string>
 
   constructor() {
     super(DB_NAME)
@@ -143,6 +155,32 @@ export class CheeseAgeDatabase extends Dexie {
             if (!Number.isFinite(shelf.occupied) || shelf.occupied < 0) shelf.occupied = 0
           })
       })
+    // v3：新增转架编排单表（内嵌有序步骤）与 kv 键值仓（跨标签页编排锁）
+    this.version(3)
+      .stores({
+        milks: 'id, farm, milkKind, collectedAt, updatedAt',
+        batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
+        shelves: 'id, room, rackNo, tempZone, capacity, occupied, updatedAt',
+        turnings: 'id, batchId, shelfId, doneAt, type, state, seq, updatedAt',
+        environments: 'id, batchId, recordedAt, anomaly, updatedAt',
+        tastings: 'id, batchId, outAt, score, conclusion, updatedAt',
+        transferPlans: 'id, code, status, createdAt, updatedAt',
+        kv: 'id'
+      })
+      .upgrade(async (tx) => {
+        // 迁移 5：编排单补齐步骤数组与状态字段（v3 新表，正常为空，此处做防御性回填）
+        await tx
+          .table<TransferPlan>('transferPlans')
+          .toCollection()
+          .modify((plan) => {
+            if (!Array.isArray(plan.steps)) plan.steps = []
+            if (typeof plan.status !== 'string') plan.status = '已编排'
+            if (typeof plan.operator !== 'string') plan.operator = '系统编排'
+            if (typeof plan.note !== 'string') plan.note = ''
+            if (typeof plan.createdAt !== 'number') plan.createdAt = Date.now()
+            if (typeof plan.updatedAt !== 'number') plan.updatedAt = plan.createdAt
+          })
+      })
   }
 }
 
@@ -158,7 +196,16 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.transferPlans,
+      db.kv
+    ],
     async () => {
       await Promise.all([
         db.milks.clear(),
@@ -166,7 +213,9 @@ export async function clearAllTables(): Promise<void> {
         db.shelves.clear(),
         db.turnings.clear(),
         db.environments.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.transferPlans.clear(),
+        db.kv.clear()
       ])
     }
   )
@@ -180,15 +229,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表记录数统计，供品评页与 README 中的「本地数据概览」展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
-    db.milks.count(),
-    db.batches.count(),
-    db.shelves.count(),
-    db.turnings.count(),
-    db.environments.count(),
-    db.tastings.count()
-  ])
-  return { milks, batches, shelves, turnings, environments, tastings }
+  const [milks, batches, shelves, turnings, environments, tastings, transferPlans] =
+    await Promise.all([
+      db.milks.count(),
+      db.batches.count(),
+      db.shelves.count(),
+      db.turnings.count(),
+      db.environments.count(),
+      db.tastings.count(),
+      db.transferPlans.count()
+    ])
+  return { milks, batches, shelves, turnings, environments, tastings, transferPlans }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -234,14 +285,16 @@ export function readLastBackupAt(): string | null {
 
 /** 组装全量导出快照 */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
-    db.milks.toArray(),
-    db.batches.toArray(),
-    db.shelves.toArray(),
-    db.turnings.toArray(),
-    db.environments.toArray(),
-    db.tastings.toArray()
-  ])
+  const [milks, batches, shelves, turnings, environments, tastings, transferPlans] =
+    await Promise.all([
+      db.milks.toArray(),
+      db.batches.toArray(),
+      db.shelves.toArray(),
+      db.turnings.toArray(),
+      db.environments.toArray(),
+      db.tastings.toArray(),
+      db.transferPlans.toArray()
+    ])
   return {
     app: 'gbcheeseage',
     dbVersion: DB_VERSION,
@@ -251,7 +304,8 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    transferPlans
   }
 }
 
@@ -263,7 +317,15 @@ export async function importSnapshot(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.transferPlans
+    ],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
@@ -271,6 +333,7 @@ export async function importSnapshot(
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
       await db.tastings.bulkPut(payload.tastings)
+      await db.transferPlans.bulkPut(payload.transferPlans)
     }
   )
   return {
@@ -279,7 +342,8 @@ export async function importSnapshot(
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    transferPlans: payload.transferPlans.length
   }
 }
 
@@ -585,9 +649,40 @@ export async function seedDatabase(): Promise<void> {
     }
   ]
 
+  const transferPlans: TransferPlan[] = [
+    {
+      id: 'trplan_seed_01',
+      code: 'ZB-DEMO-01',
+      title: '演示：水牛批次上架恒温库',
+      status: '已编排',
+      steps: [
+        {
+          seq: 1,
+          batchId: batchDId,
+          fromShelfId: null,
+          toShelfId: 'shelf_c1',
+          kind: '落位',
+          status: '待执行'
+        }
+      ],
+      operator: '系统演示',
+      note: '演示编排单：在「转架编排」页执行后，批次窖位、窖位占用与转架作业会在同一步骤内同步回写。',
+      createdAt: now,
+      updatedAt: now
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.transferPlans
+    ],
     async () => {
       await db.milks.bulkPut(milks)
       await db.batches.bulkPut(batches)
@@ -595,6 +690,7 @@ export async function seedDatabase(): Promise<void> {
       await db.turnings.bulkPut(turnings)
       await db.environments.bulkPut(environments)
       await db.tastings.bulkPut(tastings)
+      await db.transferPlans.bulkPut(transferPlans)
     }
   )
 }

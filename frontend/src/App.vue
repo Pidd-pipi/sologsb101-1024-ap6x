@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Grid, MilkTea, Odometer, Sort, Star } from '@element-plus/icons-vue'
+import { Grid, MilkTea, Odometer, Sort, Star, Switch } from '@element-plus/icons-vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
 import { useTastingStore } from '@/stores/tastingStore'
 import { useTurningStore } from '@/stores/turningStore'
+import { useTransferStore } from '@/stores/transferStore'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,11 +14,22 @@ const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
 const turningStore = useTurningStore()
 const tastingStore = useTastingStore()
+const transferStore = useTransferStore()
 
 const navItems = computed(() => [
   { path: '/milk', label: '奶源与批次', icon: MilkTea, badge: String(milkStore.batches.length) },
   { path: '/shelves', label: '货架与窖位', icon: Grid, badge: `${shelfStore.occupancyPercent}%` },
   { path: '/turnings', label: '转架作业', icon: Sort, badge: String(turningStore.summary.pending) },
+  {
+    path: '/transfers',
+    label: '转架编排',
+    icon: Switch,
+    badge: String(
+      transferStore.plans.filter(
+        (plan) => plan.status === '执行中' || transferStore.isResumable(plan)
+      ).length
+    )
+  },
   { path: '/environment', label: '温湿度', icon: Odometer, badge: '' },
   { path: '/tastings', label: '出库品评', icon: Star, badge: String(tastingStore.tastings.length) }
 ])

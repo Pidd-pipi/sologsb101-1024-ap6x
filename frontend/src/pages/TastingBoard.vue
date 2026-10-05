@@ -473,6 +473,13 @@ async function resetAll(): Promise<void> {
         <StatBadge label="转架作业" :value="counts.turnings ?? 0" suffix="条" icon="Tickets" size="small" />
         <StatBadge label="环境记录" :value="counts.environments ?? 0" suffix="条" icon="Odometer" size="small" />
         <StatBadge label="品评记录" :value="counts.tastings ?? 0" suffix="条" icon="Star" size="small" />
+        <StatBadge
+          label="转架编排单"
+          :value="counts.transferPlans ?? 0"
+          suffix="单"
+          icon="Switch"
+          size="small"
+        />
       </div>
 
       <el-descriptions :column="2" border class="desc-gap">

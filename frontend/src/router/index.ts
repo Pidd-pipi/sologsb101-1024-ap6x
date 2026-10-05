@@ -26,6 +26,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '转架作业计划', icon: 'Sort' }
   },
   {
+    path: '/transfers',
+    name: 'transfer-board',
+    component: () => import('@/pages/TransferBoard.vue'),
+    meta: { title: '转架编排', icon: 'Switch' }
+  },
+  {
     path: '/environment',
     name: 'environment-view',
     component: () => import('@/pages/EnvironmentView.vue'),
