@@ -5,13 +5,14 @@ import type { Shelf } from '@/types/shelf'
 import type { Turning } from '@/types/turning'
 import type { Environment } from '@/types/environment'
 import type { Tasting } from '@/types/tasting'
+import type { Relocation } from '@/types/relocation'
 import { addDays, diffDays } from '@/utils/temperature'
 
 /** IndexedDB 数据库名：与项目英文短名保持一致 */
 export const DB_NAME = 'gbcheeseage'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 键名（仅存少量元数据，业务数据一律在 IndexedDB） */
 export const LS_KEYS = {
@@ -46,6 +47,8 @@ export interface BackupPayload {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  /** 整批调拨转架编排单（v3 起随档案一起导出；旧文件缺省时按空数组处理） */
+  relocations?: Relocation[]
 }
 
 /** 导出的批次熟成档案：含批次、奶源、窖位与全部子记录 */
@@ -61,6 +64,8 @@ export interface BatchArchive {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  /** 与该批次相关的转架编排单（步骤中含本批次的编排单整单导出，便于续办） */
+  relocations?: Relocation[]
 }
 
 export class CheeseAgeDatabase extends Dexie {
@@ -70,6 +75,7 @@ export class CheeseAgeDatabase extends Dexie {
   turnings!: Table<Turning, string>
   environments!: Table<Environment, string>
   tastings!: Table<Tasting, string>
+  relocations!: Table<Relocation, string>
 
   constructor() {
     super(DB_NAME)
@@ -143,6 +149,16 @@ export class CheeseAgeDatabase extends Dexie {
             if (!Number.isFinite(shelf.occupied) || shelf.occupied < 0) shelf.occupied = 0
           })
       })
+    // v3：新增「整批调拨转架编排」表；既有表结构不变，无需数据回填
+    this.version(DB_VERSION).stores({
+      milks: 'id, farm, milkKind, collectedAt, updatedAt',
+      batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
+      shelves: 'id, room, rackNo, tempZone, capacity, occupied, updatedAt',
+      turnings: 'id, batchId, shelfId, doneAt, type, state, seq, updatedAt',
+      environments: 'id, batchId, recordedAt, anomaly, updatedAt',
+      tastings: 'id, batchId, outAt, score, conclusion, updatedAt',
+      relocations: 'id, status, createdAt, updatedAt'
+    })
   }
 }
 
@@ -158,7 +174,15 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.relocations
+    ],
     async () => {
       await Promise.all([
         db.milks.clear(),
@@ -166,7 +190,8 @@ export async function clearAllTables(): Promise<void> {
         db.shelves.clear(),
         db.turnings.clear(),
         db.environments.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.relocations.clear()
       ])
     }
   )
@@ -180,15 +205,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表记录数统计，供品评页与 README 中的「本地数据概览」展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
-    db.milks.count(),
-    db.batches.count(),
-    db.shelves.count(),
-    db.turnings.count(),
-    db.environments.count(),
-    db.tastings.count()
-  ])
-  return { milks, batches, shelves, turnings, environments, tastings }
+  const [milks, batches, shelves, turnings, environments, tastings, relocations] =
+    await Promise.all([
+      db.milks.count(),
+      db.batches.count(),
+      db.shelves.count(),
+      db.turnings.count(),
+      db.environments.count(),
+      db.tastings.count(),
+      db.relocations.count()
+    ])
+  return { milks, batches, shelves, turnings, environments, tastings, relocations }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -234,14 +261,16 @@ export function readLastBackupAt(): string | null {
 
 /** 组装全量导出快照 */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
-    db.milks.toArray(),
-    db.batches.toArray(),
-    db.shelves.toArray(),
-    db.turnings.toArray(),
-    db.environments.toArray(),
-    db.tastings.toArray()
-  ])
+  const [milks, batches, shelves, turnings, environments, tastings, relocations] =
+    await Promise.all([
+      db.milks.toArray(),
+      db.batches.toArray(),
+      db.shelves.toArray(),
+      db.turnings.toArray(),
+      db.environments.toArray(),
+      db.tastings.toArray(),
+      db.relocations.toArray()
+    ])
   return {
     app: 'gbcheeseage',
     dbVersion: DB_VERSION,
@@ -251,7 +280,8 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    relocations
   }
 }
 
@@ -263,7 +293,15 @@ export async function importSnapshot(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.relocations
+    ],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
@@ -271,6 +309,7 @@ export async function importSnapshot(
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
       await db.tastings.bulkPut(payload.tastings)
+      await db.relocations.bulkPut(payload.relocations ?? [])
     }
   )
   return {
@@ -279,7 +318,8 @@ export async function importSnapshot(
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    relocations: (payload.relocations ?? []).length
   }
 }
 
@@ -585,9 +625,45 @@ export async function seedDatabase(): Promise<void> {
     }
   ]
 
+  // 演示编排单：整批改放二号恒温库 C-01（待执行，刷新页面后可继续逐步办理）
+  const relocations: Relocation[] = [
+    {
+      id: 'relo_demo_01',
+      title: '洗皮批次整批挪入二号恒温库',
+      operator: '周雨',
+      plannedAt: '2025-03-24',
+      turningType: '转架',
+      brinePct: 22,
+      status: '待执行',
+      batchIds: [batchBId],
+      shelfIds: ['shelf_b2', 'shelf_c1'],
+      steps: [
+        {
+          seq: 1,
+          batchId: batchBId,
+          fromShelfId: 'shelf_b2',
+          toShelfId: 'shelf_c1',
+          temporary: false,
+          note: '洗皮 · 2025-03-10：一号熟成库 B-02 第 2 层 → 二号恒温库 C-01 第 1 层',
+          state: '待执行',
+          turningId: null,
+          doneAt: null,
+          executedAt: null,
+          failReason: '',
+          failedAt: null
+        }
+      ],
+      failReason: '',
+      createdAt: now,
+      updatedAt: now,
+      confirmedAt: now,
+      completedAt: null
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.relocations],
     async () => {
       await db.milks.bulkPut(milks)
       await db.batches.bulkPut(batches)
@@ -595,6 +671,7 @@ export async function seedDatabase(): Promise<void> {
       await db.turnings.bulkPut(turnings)
       await db.environments.bulkPut(environments)
       await db.tastings.bulkPut(tastings)
+      await db.relocations.bulkPut(relocations)
     }
   )
 }

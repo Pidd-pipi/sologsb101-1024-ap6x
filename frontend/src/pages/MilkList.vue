@@ -271,8 +271,12 @@ async function removeMilk(milk: Milk): Promise<void> {
   } catch {
     return
   }
-  await milkStore.removeMilk(milk.id)
-  ElMessage.success('奶源及其关联批次已删除')
+  try {
+    await milkStore.removeMilk(milk.id)
+    ElMessage.success('奶源及其关联批次已删除')
+  } catch (err) {
+    ElMessage.warning(err instanceof Error ? err.message : '删除失败，请先处理关联的转架编排')
+  }
 }
 
 async function removeBatch(batch: Batch): Promise<void> {
@@ -285,8 +289,12 @@ async function removeBatch(batch: Batch): Promise<void> {
   } catch {
     return
   }
-  await milkStore.removeBatch(batch.id)
-  ElMessage.success('批次及其子记录已删除')
+  try {
+    await milkStore.removeBatch(batch.id)
+    ElMessage.success('批次及其子记录已删除')
+  } catch (err) {
+    ElMessage.warning(err instanceof Error ? err.message : '删除失败，请先处理关联的转架编排')
+  }
 }
 
 /** 状态流转：凝乳 → 熟成中 → 已出库 / 报废 */

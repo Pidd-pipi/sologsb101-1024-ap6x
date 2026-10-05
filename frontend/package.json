@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview --port 22824"
+    "preview": "vite preview --port 22824",
+    "test:planner": "esbuild scripts/planner.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/planner.test.mjs --log-level=warning && node node_modules/.cache/planner.test.mjs",
+    "test:relocation": "esbuild scripts/relocation.itest.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/relocation.itest.mjs --log-level=warning && node node_modules/.cache/relocation.itest.mjs",
+    "test": "npm run test:planner && npm run test:relocation"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",
@@ -19,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@vitejs/plugin-vue": "^5.2.1",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "~5.7.3",
     "vite": "^6.1.0",
     "vue-tsc": "^2.2.0"

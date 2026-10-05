@@ -25,6 +25,10 @@ export interface Turning {
   state: TurningState
   /** 作业计划内的执行顺序，由拖拽排序写回，从 1 开始 */
   seq: number
+  /** 由转架编排单办理生成时，记录来源编排单 id（幂等防重的回链） */
+  relocationId?: string
+  /** 由转架编排单办理生成时，记录对应步骤序号 */
+  relocationStepSeq?: number
   createdAt: number
   updatedAt: number
 }

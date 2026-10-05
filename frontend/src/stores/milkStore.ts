@@ -18,6 +18,7 @@ import {
 } from '@/types/batch'
 import { computeAging } from '@/hooks/useAgingDays'
 import { toDateString } from '@/utils/temperature'
+import { useRelocationStore } from '@/stores/relocationStore'
 
 export interface NewMilkInput {
   farm: string
@@ -46,6 +47,7 @@ export const useMilkStore = defineStore('milk', () => {
   const batchesTable = useIdbTable<Batch>((database) => database.batches, {
     sortByUpdatedAt: false
   })
+  const relocationStore = useRelocationStore()
 
   const filter = ref<MilkFilterState>(createEmptyMilkFilter())
   const currentMilkId = ref<string | null>(null)
@@ -193,6 +195,14 @@ export const useMilkStore = defineStore('milk', () => {
   /** 级联删除：奶源 → 批次 → 转架 / 环境 / 品评 */
   async function removeMilk(id: string): Promise<void> {
     const batchIds = batches.value.filter((batch) => batch.milkId === id).map((batch) => batch.id)
+    const heldBy = batchIds
+      .map((batchId) => relocationStore.activePlanHoldingBatch(batchId))
+      .find((plan) => plan !== null)
+    if (heldBy) {
+      throw new Error(
+        `该奶源下有批次仍在转架编排单「${heldBy.title}」中办理，请先完成或取消该编排单后再删除`
+      )
+    }
     await db.transaction(
       'rw',
       [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
@@ -237,6 +247,12 @@ export const useMilkStore = defineStore('milk', () => {
   async function removeBatch(id: string): Promise<boolean> {
     const batch = batches.value.find((item) => item.id === id)
     if (!batch) return false
+    const heldBy = relocationStore.activePlanHoldingBatch(id)
+    if (heldBy) {
+      throw new Error(
+        `批次仍在转架编排单「${heldBy.title}」中办理，请先完成或取消该编排单后再删除`
+      )
+    }
     await db.transaction(
       'rw',
       [db.batches, db.shelves, db.turnings, db.environments, db.tastings],

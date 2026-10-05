@@ -183,8 +183,12 @@ async function removeShelf(shelf: Shelf): Promise<void> {
   } catch {
     return
   }
-  await shelfStore.removeShelf(shelf.id)
-  ElMessage.success('窖位已删除，关联批次已置为未上架')
+  try {
+    await shelfStore.removeShelf(shelf.id)
+    ElMessage.success('窖位已删除，关联批次已置为未上架')
+  } catch (err) {
+    ElMessage.warning(err instanceof Error ? err.message : '删除失败，请先处理关联的转架编排')
+  }
 }
 
 function openAssignDialog(shelfId?: string): void {

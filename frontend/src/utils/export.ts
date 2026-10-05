@@ -7,6 +7,7 @@ import {
   type BackupPayload,
   type BatchArchive
 } from '@/utils/db'
+import type { Relocation } from '@/types/relocation'
 
 /** 导入 / 校验结果：校验失败时 errors 非空、payload 为 null */
 export interface ParseResult {
@@ -15,14 +16,12 @@ export interface ParseResult {
   payload: BackupPayload | null
 }
 
-const COLLECTIONS: Array<keyof Pick<BackupPayload, 'milks' | 'batches' | 'shelves' | 'turnings' | 'environments' | 'tastings'>> = [
-  'milks',
-  'batches',
-  'shelves',
-  'turnings',
-  'environments',
-  'tastings'
-]
+const COLLECTIONS: Array<
+  keyof Pick<
+    BackupPayload,
+    'milks' | 'batches' | 'shelves' | 'turnings' | 'environments' | 'tastings'
+  >
+> = ['milks', 'batches', 'shelves', 'turnings', 'environments', 'tastings']
 
 function isPlainObject(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input)
@@ -46,6 +45,9 @@ export function validatePayload(input: unknown): ParseResult {
   if (errors.length > 0) return { ok: false, errors, payload: null }
 
   const obj = input as Partial<BackupPayload>
+  const relocations: Relocation[] = Array.isArray(obj.relocations)
+    ? (obj.relocations as Relocation[]).filter((item) => typeof item?.id === 'string')
+    : []
   const payload: BackupPayload = {
     app: 'gbcheeseage',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
@@ -55,7 +57,8 @@ export function validatePayload(input: unknown): ParseResult {
     shelves: (obj.shelves ?? []).filter((item) => typeof item?.id === 'string'),
     turnings: (obj.turnings ?? []).filter((item) => typeof item?.id === 'string'),
     environments: (obj.environments ?? []).filter((item) => typeof item?.id === 'string'),
-    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string')
+    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string'),
+    relocations
   }
   if (payload.batches.length === 0 && payload.milks.length === 0) {
     errors.push('文件中没有任何奶源或批次记录')
@@ -83,6 +86,14 @@ export function validatePayload(input: unknown): ParseResult {
     if (!batchIds.has(tasting.batchId)) {
       errors.push(`品评记录 ${tasting.id} 引用了不存在的批次 ${tasting.batchId}`)
     }
+  })
+  // 编排单步骤引用的批次必须存在；窖位允许引用文件内已有窖位（旧档案可能缺窖位表，仅警告不拦截）
+  payload.relocations?.forEach((plan) => {
+    plan.steps?.forEach((step) => {
+      if (!batchIds.has(step.batchId)) {
+        errors.push(`转架编排单 ${plan.id} 的步骤引用了不存在的批次 ${step.batchId}`)
+      }
+    })
   })
   if (errors.length > 0) return { ok: false, errors, payload: null }
   return { ok: true, errors, payload }
@@ -126,14 +137,16 @@ function stamp(): string {
 
 /** 导出全量档案 JSON */
 export async function exportSnapshotJson(): Promise<{ fileName: string; counts: Record<string, number> }> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
-    db.milks.toArray(),
-    db.batches.toArray(),
-    db.shelves.toArray(),
-    db.turnings.toArray(),
-    db.environments.toArray(),
-    db.tastings.toArray()
-  ])
+  const [milks, batches, shelves, turnings, environments, tastings, relocations] =
+    await Promise.all([
+      db.milks.toArray(),
+      db.batches.toArray(),
+      db.shelves.toArray(),
+      db.turnings.toArray(),
+      db.environments.toArray(),
+      db.tastings.toArray(),
+      db.relocations.toArray()
+    ])
   const payload: BackupPayload = {
     app: 'gbcheeseage',
     dbVersion: DB_VERSION,
@@ -143,7 +156,8 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    relocations
   }
   const fileName = `gbcheeseage-archive-v${DB_VERSION}-${stamp()}.json`
   downloadJson(fileName, payload)
@@ -156,24 +170,38 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       shelves: shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      relocations: relocations.length
     }
   }
 }
 
-/** 导出单个批次的熟成档案（含奶源、窖位、转架、环境与品评） */
+/** 导出单个批次的熟成档案（含奶源、窖位、转架、环境、品评与相关转架编排单） */
 export async function exportBatchArchiveJson(
   batchId: string
 ): Promise<{ fileName: string; counts: Record<string, number> }> {
   const batch = await db.batches.get(batchId)
   if (!batch) throw new Error('批次不存在，无法导出')
-  const [milks, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, shelves, turnings, environments, tastings, allRelocations] = await Promise.all([
     db.milks.toArray(),
     db.shelves.toArray(),
     db.turnings.where('batchId').equals(batchId).toArray(),
     db.environments.where('batchId').equals(batchId).toArray(),
-    db.tastings.where('batchId').equals(batchId).toArray()
+    db.tastings.where('batchId').equals(batchId).toArray(),
+    db.relocations.toArray()
   ])
+  // 步骤中涉及本批次的编排单整单带出（含临时位、失败原因与执行状态，便于另一侧接着处理）
+  const relocations = allRelocations.filter((plan) =>
+    plan.steps.some((step) => step.batchId === batchId)
+  )
+  // 编排步骤引用到的窖位也要纳入档案
+  const relocationShelfIds = new Set<string>()
+  relocations.forEach((plan) => {
+    plan.steps.forEach((step) => {
+      relocationShelfIds.add(step.toShelfId)
+      if (step.fromShelfId) relocationShelfIds.add(step.fromShelfId)
+    })
+  })
   const archive: BatchArchive = {
     app: 'gbcheeseage',
     dbVersion: DB_VERSION,
@@ -182,10 +210,13 @@ export async function exportBatchArchiveJson(
     batchId,
     milks: milks.filter((milk) => milk.id === batch.milkId),
     batches: [batch],
-    shelves: shelves.filter((shelf) => shelf.id === batch.shelfId),
+    shelves: shelves.filter(
+      (shelf) => shelf.id === batch.shelfId || relocationShelfIds.has(shelf.id)
+    ),
     turnings,
     environments,
-    tastings
+    tastings,
+    relocations
   }
   const fileName = `gbcheeseage-batch-${batchId}-${stamp()}.json`
   downloadJson(fileName, archive)
@@ -197,7 +228,8 @@ export async function exportBatchArchiveJson(
       shelves: archive.shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      relocations: relocations.length
     }
   }
 }
@@ -210,7 +242,15 @@ export async function importSnapshotJson(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.relocations
+    ],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
@@ -218,6 +258,7 @@ export async function importSnapshotJson(
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
       await db.tastings.bulkPut(payload.tastings)
+      await db.relocations.bulkPut(payload.relocations ?? [])
     }
   )
   return {
@@ -226,7 +267,8 @@ export async function importSnapshotJson(
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    relocations: (payload.relocations ?? []).length
   }
 }
 
@@ -272,6 +314,25 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
     id: createId('tast'),
     batchId: batchIdMap.get(tasting.batchId) ?? tasting.batchId
   }))
+  const relocations = (payload.relocations ?? []).map((plan) => {
+    const id = createId('relo')
+    const remapBatch = (value: string): string => batchIdMap.get(value) ?? value
+    const remapShelf = (value: string): string => shelfIdMap.get(value) ?? value
+    const steps = plan.steps.map((step) => ({
+      ...step,
+      batchId: remapBatch(step.batchId),
+      fromShelfId: step.fromShelfId ? remapShelf(step.fromShelfId) : null,
+      toShelfId: remapShelf(step.toShelfId),
+      turningId: step.turningId ? createId('turn') : null
+    }))
+    return {
+      ...plan,
+      id,
+      batchIds: plan.batchIds.map(remapBatch),
+      shelfIds: plan.shelfIds.map(remapShelf),
+      steps
+    }
+  })
 
-  return { ...payload, milks, batches, shelves, turnings, environments, tastings }
+  return { ...payload, milks, batches, shelves, turnings, environments, tastings, relocations }
 }

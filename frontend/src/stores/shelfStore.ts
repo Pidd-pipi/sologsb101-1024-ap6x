@@ -13,6 +13,7 @@ import {
 } from '@/types/shelf'
 import type { Batch } from '@/types/batch'
 import { useMilkStore } from '@/stores/milkStore'
+import { useRelocationStore } from '@/stores/relocationStore'
 
 export interface NewShelfInput {
   room: string
@@ -162,6 +163,12 @@ export const useShelfStore = defineStore('shelf', () => {
 
   /** 级联删除：窖位 → 解除批次挂接（批次本身保留） */
   async function removeShelf(id: string): Promise<void> {
+    const heldBy = useRelocationStore().activePlanHoldingShelf(id)
+    if (heldBy) {
+      throw new Error(
+        `窖位仍被转架编排单「${heldBy.title}」的未完成步骤使用，请先完成或取消该编排单后再删除`
+      )
+    }
     await db.transaction('rw', [db.shelves, db.batches], async () => {
       const hosted = await db.batches.where('shelfId').equals(id).toArray()
       for (const batch of hosted) {
@@ -185,6 +192,23 @@ export const useShelfStore = defineStore('shelf', () => {
       return { ok: false, message: `批次状态为「${batch.state}」，不能再上架` }
     }
     if (batch.shelfId === shelfId) return { ok: false, message: '该批次已在此窖位上' }
+
+    // 在办转架编排中的批次 / 目标窖位受锁保护，避免手动上架破坏编排队列与容量假设
+    const relocationStore = useRelocationStore()
+    const batchHolder = relocationStore.activePlanHoldingBatch(batchId)
+    if (batchHolder) {
+      return {
+        ok: false,
+        message: `批次在转架编排单「${batchHolder.title}」中办理，请先完成或取消该编排单后再手动上架`
+      }
+    }
+    const shelfHolder = relocationStore.activePlanHoldingShelf(shelfId)
+    if (shelfHolder) {
+      return {
+        ok: false,
+        message: `该窖位被在办编排单「${shelfHolder.title}」使用，请先完成或取消该编排单后再向其上架`
+      }
+    }
 
     // 余量校验以数据库中的最新占用数为准（并兜底取 store 中的较大值），避免快速连续上架时读到缓存值
     const [liveRow, hosted] = await Promise.all([
@@ -243,6 +267,13 @@ export const useShelfStore = defineStore('shelf', () => {
     const batch = milkStore.batches.find((item) => item.id === batchId)
     if (!batch) return { ok: false, message: '批次不存在，请刷新后重试' }
     if (!batch.shelfId) return { ok: false, message: '该批次尚未上架' }
+    const holder = useRelocationStore().activePlanHoldingBatch(batchId)
+    if (holder) {
+      return {
+        ok: false,
+        message: `批次在转架编排单「${holder.title}」中办理，请先完成或取消该编排单后再手动下架`
+      }
+    }
     const shelfId = batch.shelfId
     const now = Date.now()
     await db.transaction('rw', [db.shelves, db.batches], async () => {

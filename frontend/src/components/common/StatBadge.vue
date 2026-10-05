@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import type { Component } from 'vue'
 import {
   AlarmClock,
+  CircleCheckFilled,
   Coin,
   DataLine,
   Files,
@@ -10,6 +11,7 @@ import {
   Histogram,
   Odometer,
   PieChart,
+  Sort,
   Star,
   TrendCharts,
   WarningFilled
@@ -59,6 +61,7 @@ const toneColor: Record<BadgeTone, string> = {
 
 const iconMap: Record<string, Component> = {
   AlarmClock,
+  CircleCheckFilled,
   Coin,
   DataLine,
   Files,
@@ -66,6 +69,7 @@ const iconMap: Record<string, Component> = {
   Histogram,
   Odometer,
   PieChart,
+  Sort,
   Star,
   TrendCharts,
   WarningFilled
